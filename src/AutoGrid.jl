@@ -51,13 +51,13 @@ struct WrappingFuncConfig{saving, YscaleT<:Function, Diff2T, Diff3T, T<:Number} 
 end
 FuncConfig{saving}(yscale, wrapplims) where saving = FuncConfig{saving}(yscale, wrapplims, normdiff, normdiffdiff)
 
-AutoGridConfig(func::FuncT, lims::NTuple{2,LT}, xscale::XscaleT, xscale_inv::XscaleInvT, yscales::YscaleT;
+AutoGridConfig(func::FuncT, lims::NTuple{2,LT}, xscale::XscaleT, xscale_inv::XscaleInvT, funcConfigs::FuncConfigs;
                 start_gridpoints=30, maxgridpoints=2000,
                 min_eps::FloatT=(xscale(lims[2])-xscale_inv(lims[1]))/10000,
-                reltol_dd::FloatT=0.05, abstol_dd::FloatT=1e-2) where {N, FloatT<:Number, FuncT<:Function, XscaleT<:Function, XscaleInvT<:Function, YscaleT<:Tuple{Vararg{<:Function,N}}, LT<:Number} =
-    AutoGridConfig{N, FloatT, FuncT, XscaleT, XscaleInvT, YscaleT, LT}(func, lims, xscale, xscale_inv, yscales, start_gridpoints, maxgridpoints, min_eps, reltol_dd, abstol_dd)
+                reltol_dd::FloatT=0.05, abstol_dd::FloatT=1e-2) where {N, FloatT<:Number, FuncT<:Function, XscaleT<:Function, XscaleInvT<:Function, FuncConfigs<:Tuple{Vararg{<:AbstractFuncConfig,N}}, LT<:Number} =
+    AutoGridConfig{N, FloatT, FuncT, XscaleT, XscaleInvT, FuncConfigs, LT}(func, lims, xscale, xscale_inv, funcConfigs, start_gridpoints, maxgridpoints, min_eps, reltol_dd, abstol_dd)
 """
-values, grid = auto_grid(func::Function, N, lims::Tuple, xscale=(identity, identity), yscales=ntuple(i-> identity, N); start_gridpoints, maxgridpoints, min_eps, reltol_dd, abstol_dd)
+values, grid = auto_grid(func::Function, N, lims::Tuple, xscale=(identity, identity), FINCCONFIGSDEF; start_gridpoints, maxgridpoints, min_eps, reltol_dd, abstol_dd)
 values, grid = auto_grid(agc::AutoGridConfig)
     
     Arguments:
@@ -108,12 +108,12 @@ function auto_grid(agc::AbstractAutoGridConfig)
     num_gridpoints = agc.start_gridpoints
 
     func = agc.func
-    yscales = agc.yscales
+    funcConfigs = agc.funcConfigs
     # Current left point
     x1 = init_grid[1]
     x1_id = agc.xscale_inv(x1)
     
-    y1 = apply_tuple3(yscales, func(x1_id))
+    y1 = apply_config_scales(funcConfigs, func(x1_id))
 
     y1_id = func(x1_id)
 
@@ -127,7 +127,7 @@ function auto_grid(agc::AbstractAutoGridConfig)
         # Scale back to identity
         x2_id = agc.xscale_inv(x2)
         y2_id = func(x2_id)
-        y2 = apply_tuple3(yscales, y2_id)
+        y2 = apply_config_scales(funcConfigs, y2_id)
         # Refine (if nessesary) section (x1,x2)
         num_gridpoints = refine_grid!(values, grid, x1, x2, y1, y2, y1_id, y2_id, num_gridpoints, agc)
         # We are now done with [x1,x2]
@@ -139,60 +139,11 @@ function auto_grid(agc::AbstractAutoGridConfig)
     return values, grid
 end
 
-function auto_grid_alloc(agc::AbstractAutoGridConfig)
-    func = agc.func
-    yscales = agc.yscales
+apply_scale(fc::AbstractFuncConfig, y_id) = fc.yscale(y_id)
+apply_scale(fc::SavingFuncConfig, y_id) = nothing
 
-    # Linearly spaced grid in xscale
-    init_grid = LinRange(agc.xscale(agc.lims[1]), agc.xscale(agc.lims[2]), agc.start_gridpoints)
-
-    # Current count of number mindpoints
-    num_gridpoints = agc.start_gridpoints
-
-    # Current left point
-    x1 = init_grid[1]
-    x1_id = agc.xscale_inv(x1)
-    y1 = apply_tuple3(yscales, func(x1_id))
-    y1_id = func(x1_id)
-
-
-    # The full set of gridpoints
-    grid = [x1_id,]
-    # Tuple with list of all values (Faster than list of tuples + reshaping)
-    #values = ntuple(i -> [y1_id[i],], length(yscales)) # Type unstable, but low performance cost, but affects output
-    values = tuple_of_vectors(y1_id)
-
-    # Compute some values on initial grid
-    init_grid_vals = similar.(values, agc.start_gridpoints)
-
-    for (i,x) in enumerate(init_grid)
-        x_id = agc.xscale_inv(x)
-        y_id = func(x_id)
-        y = apply_tuple3(yscales, y_id)
-        setindex!.(init_grid_vals, y, i)
-    end
-    @show abs.(init_grid_vals[1])
-    @show real.(diff(init_grid_vals[1]))
-    grid_norms = [norm.(init_grid_vals[i])./(init_grid[2]-init_grid[1]) for i in 1:length(init_grid_vals)]
-    grid_diffs_norms = [sqrt.(normdiff2.(init_grid_vals[i][1:end-1],init_grid_vals[i][2:end]))./(init_grid[2]-init_grid[1]) for i in 1:length(init_grid_vals)]
-    println(grid_norms)
-    println(grid_diffs_norms)
-    # println(diffs)
-
-    for x2 in init_grid[2:end]
-        # Scale back to identity
-        x2_id = agc.xscale_inv(x2)
-        y2_id = func(x2_id)
-        y2 = apply_tuple3(yscales, y2_id)
-        # Refine (if nessesary) section (x1,x2)
-        num_gridpoints = refine_grid!(values, grid, x1, x2, y1, y2, y1_id, y2_id, num_gridpoints, agc)
-        # We are now done with [x1,x2]
-        # Continue to next segment
-        x1 = x2
-        y1 = y2
-        y1_id = y2_id
-    end
-    return values, grid
+function apply_config_scales(funcConfigs, y_id)
+    map(apply_scale, funcConfigs, y_id)
 end
 
 # Given range (x1, x2) potentially add more gridpoints. x1 is assumed to be already added, x2 will be added
@@ -203,11 +154,11 @@ function refine_grid!(values, grid, x1, x2, y1, y2, y1_id, y2_id, num_gridpoints
     # Scaled back
     xm_id = agc.xscale_inv(xm)
     ym_id = agc.func(xm_id)
-    ym = apply_tuple3(agc.yscales, ym_id)
+    ym = apply_config_scales(agc.yscales, ym_id)
 
     (num_gridpoints >= agc.maxgridpoints) && @warn "Maximum number of gridpoints reached in refine_grid! at $xm_id, no further refinement will be made. Increase maxgridpoints to get better accuracy." maxlog=1
     #min_eps in scaled version, abs to avoid assuming monotonly increasing scale
-    if (abs(x2 - x1) >= agc.min_eps) && (num_gridpoints < agc.maxgridpoints) && !is_almost_linear(y1, ym, y2, agc)
+    if (abs(x2 - x1) >= agc.min_eps) && (num_gridpoints < agc.maxgridpoints) && should_refine(y1, ym, y2, agc)
         num_gridpoints = refine_grid!(values, grid, x1, xm, y1, ym, y1_id, ym_id, num_gridpoints, agc)
         num_gridpoints = refine_grid!(values, grid, xm, x2, ym, y2, ym_id, y2_id, num_gridpoints, agc)
     else
@@ -223,12 +174,17 @@ end
 
 # TODO We can scale when saving instead of recomputing scaling
 # Svectors should also be faster in general
-@inline  function is_almost_linear(y1, ym, y2, agc::AbstractAutoGridConfig)
+@inline function should_refine(y1, ym, y2, agc::AbstractAutoGridConfig)
+    !all(map(is_almost_linear, v1, v2, v3, agc.funcConfigs, agc))
+end
+
+@inline function is_almost_linear(y1, ym, y2, fc::AbstractFuncConfig, agc::AbstractAutoGridConfig)
     # We assume that x2-x1 \approx  x3-x2, so we need to check that ym-y1 approx y2-ym
     # Essentially low second derivative compared to derivative, so that linear approximation is good.
     # Second argument to avoid too small steps when derivatives are small
-    normdiffdiff(y1,ym,y2) < max(agc.reltol_dd*max(normdiff(ym,y1), normdiff(y2,ym)), agc.abstol_dd)
+    normdiffdiff2(y1,ym,y2) < max((agc.reltol_dd)^2*max(normdiff2(ym,y1), normdiff2(y2,ym)), (agc.abstol_dd)^2)
 end
+@inline is_almost_linear(y1, ym, y2, fc::SavingFuncConfig) = true
 
 # This will probably never (almost) be called
 @inline normdiff2(x::Number,y::Number) = abs2(x-y)
@@ -249,7 +205,7 @@ function normdiff2(x,y)
     end
     return sum
 end
-@inline normdiff(x,y) = sqrt(normdiff2(x,y))
+# @inline normdiff(x,y) = sqrt(normdiff2(x,y))
 
 
 # This will probably never(almost) be called
@@ -271,22 +227,80 @@ function normdiffdiff2(x,y,z)
     end
     return sum
 end
-@inline normdiffdiff(x,y,z) = sqrt(normdiffdiff2(x,y,z))
+# @inline normdiffdiff(x,y,z) = sqrt(normdiffdiff2(x,y,z))
 
-@generated function apply_tuple3(fs::Tuple{Vararg{<:Any,N}}, x::Tuple{Vararg{<:Any,N}}) where N
-    vec = []
-    for i in 1:N
-        push!(vec, :(fs[$i].(x[$i])))
-    end
-    :(Core.tuple($(vec...)))
+# @generated function apply_tuple3(fs::Tuple{Vararg{<:Any,N}}, x::Tuple{Vararg{<:Any,N}}) where N
+#     vec = []
+#     for i in 1:N
+#         push!(vec, :(fs[$i].(x[$i])))
+#     end
+#     :(Core.tuple($(vec...)))
+# end
+
+# @generated function tuple_of_vectors(y1_id::Tuple{Vararg{<:Any,N}}) where {N}
+#     vec = []
+#     for i in 1:N
+#         push!(vec, :([y1_id[$i],]))
+#     end
+#     :(Core.tuple($(vec...),))
+# end
+
 end
 
-@generated function tuple_of_vectors(y1_id::Tuple{Vararg{<:Any,N}}) where {N}
-    vec = []
-    for i in 1:N
-        push!(vec, :([y1_id[$i],]))
-    end
-    :(Core.tuple($(vec...),))
-end
 
-end
+
+# function auto_grid_alloc(agc::AbstractAutoGridConfig)
+#     func = agc.func
+#     yscales = agc.yscales
+
+#     # Linearly spaced grid in xscale
+#     init_grid = LinRange(agc.xscale(agc.lims[1]), agc.xscale(agc.lims[2]), agc.start_gridpoints)
+
+#     # Current count of number mindpoints
+#     num_gridpoints = agc.start_gridpoints
+
+#     # Current left point
+#     x1 = init_grid[1]
+#     x1_id = agc.xscale_inv(x1)
+#     y1 = apply_tuple3(yscales, func(x1_id))
+#     y1_id = func(x1_id)
+
+
+#     # The full set of gridpoints
+#     grid = [x1_id,]
+#     # Tuple with list of all values (Faster than list of tuples + reshaping)
+#     #values = ntuple(i -> [y1_id[i],], length(yscales)) # Type unstable, but low performance cost, but affects output
+#     values = tuple_of_vectors(y1_id)
+
+#     # Compute some values on initial grid
+#     init_grid_vals = similar.(values, agc.start_gridpoints)
+
+#     for (i,x) in enumerate(init_grid)
+#         x_id = agc.xscale_inv(x)
+#         y_id = func(x_id)
+#         y = apply_tuple3(yscales, y_id)
+#         setindex!.(init_grid_vals, y, i)
+#     end
+#     @show abs.(init_grid_vals[1])
+#     @show real.(diff(init_grid_vals[1]))
+#     grid_norms = [norm.(init_grid_vals[i])./(init_grid[2]-init_grid[1]) for i in 1:length(init_grid_vals)]
+#     grid_diffs_norms = [sqrt.(normdiff2.(init_grid_vals[i][1:end-1],init_grid_vals[i][2:end]))./(init_grid[2]-init_grid[1]) for i in 1:length(init_grid_vals)]
+#     println(grid_norms)
+#     println(grid_diffs_norms)
+#     # println(diffs)
+
+#     for x2 in init_grid[2:end]
+#         # Scale back to identity
+#         x2_id = agc.xscale_inv(x2)
+#         y2_id = func(x2_id)
+#         y2 = apply_tuple3(yscales, y2_id)
+#         # Refine (if nessesary) section (x1,x2)
+#         num_gridpoints = refine_grid!(values, grid, x1, x2, y1, y2, y1_id, y2_id, num_gridpoints, agc)
+#         # We are now done with [x1,x2]
+#         # Continue to next segment
+#         x1 = x2
+#         y1 = y2
+#         y1_id = y2_id
+#     end
+#     return values, grid
+# end
