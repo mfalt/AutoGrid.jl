@@ -1,6 +1,6 @@
 name = "AutoGrid"
 uuid = "61cd762b-dd1c-4187-98e8-58fe2ab6b2c2"
-authors = ["Mattias Fält <mattiasf@control.lth.se> and contributors"]
+authors = ["Mattias Fält <mattias@mfalt.com> and contributors"]
 version = "0.1.0"
 
 [compat]
