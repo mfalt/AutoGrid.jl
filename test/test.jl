@@ -7,7 +7,7 @@ func = function (x)
     return (abs(x)<pi ? sin(x) : x > 0 ? -(pi-x)^2 : (-pi-x)^2, abs(x-0.15)+2)
     # return (sin(x),)
 end
-lims = (-1.5, 1.6)
+lims = (-3, 3)
 xscale = identity
 xscale_inv = identity
 funcConfigs = (FuncConfig(identity, find_peaks=false), FuncConfig(identity, find_peaks=false))
@@ -40,7 +40,8 @@ end
 # No peaks
 # 180.647 μs (2412 allocations: 91.73 KiB) Length: 85
 # Both peaks
-# 521.662 μs (6831 allocations: 256.01 KiB) Length: 171
+# 35.296 μs (61 allocations: 20.11 KiB) Length: 196
+# 68.038 μs (59 allocations: 29.14 KiB) Length: 376
 
 # Bench 1:
 # 1.836 μs (4 allocations: 2.88 KiB)

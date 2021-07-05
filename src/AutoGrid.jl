@@ -144,7 +144,7 @@ function auto_grid(agc::AbstractAutoGridConfig)
     while true
         stop_refine = num_gridpoints >= agc.maxgridpoints
         stop_refine && @warn "Maximum number of gridpoints reached in refine_grid! at $x2_id, no further refinement will be made. Increase maxgridpoints to get better accuracy." maxlog=1
-        # TODO! use differences in x
+
         if !stop_refine && (max(abs(x2 - x1),abs(x3 - x2)) >= agc.min_eps) && should_refine(y1, y2, y3, x1, x2, x3, agc)
             xm_right = (x2+x3)/2
             xm_left = (x1+x2)/2
@@ -161,11 +161,11 @@ function auto_grid(agc::AbstractAutoGridConfig)
         else
             # Save completed values to output
             push!(grid_id, x2_id)
-            map(save, values_id, y2_id, agc.funcConfigs)
+            tuple_map(save, values_id, y2_id, agc.funcConfigs)
 
             if isempty(buffer_x) # We are done
                 push!(grid_id, x3_id)
-                map(save, values_id, y3_id, agc.funcConfigs)
+                tuple_map(save, values_id, y3_id, agc.funcConfigs)
                 break
             end
             # Prepare for next loop
@@ -188,8 +188,8 @@ end
 function push_buffers!(xi, xi_id, yi, yi_id, buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
     push!(buffer_x, xi) # Slightly unnessesary alloc
     push!(buffer_x_id, xi_id)
-    map(save, buffer_values, yi, funcConfigs)
-    map(save, buffer_values_id, yi_id, funcConfigs)
+    tuple_map(save, buffer_values, yi, funcConfigs)
+    tuple_map(save, buffer_values_id, yi_id, funcConfigs)
     return
 end
 
@@ -205,21 +205,17 @@ apply_scale(fc::AbstractFuncConfig, y_id) = fc.yscale(y_id)
 #apply_scale(fc::SavingFuncConfig, y_id) = nothing
 
 function apply_config_scales(funcConfigs, y_id)
-    map(apply_scale, funcConfigs, y_id)
+    tuple_map(apply_scale, funcConfigs, y_id)
 end
 
 # TODO We can scale when saving instead of recomputing scaling
 # Svectors should also be faster in general
 function should_refine(v1, v2, v3, x1, x2, x3, agc::AbstractAutoGridConfig)
-    not_linear = !all(is_almost_linear.(v1, v2, v3, x1, x2, x3, agc.funcConfigs, Ref(agc))) # Ref so struct is scalar
+    not_linear = !all(tuple_map(is_almost_linear, v1, v2, v3, x1, x2, x3, agc.funcConfigs, agc))
     if not_linear
-        # println("Not linear")
         return not_linear
-    else
-        # println("Linear")
     end
-    is_peak = any(potential_peak.(v1, v2, v3, agc.funcConfigs, Ref(agc)))
-    # println("Peak: $is_peak")
+    is_peak = any(tuple_map(potential_peak, v1, v2, v3, agc.funcConfigs, agc))
     return is_peak
 end
 
@@ -237,20 +233,16 @@ end
     return s
 end
 
-@inline function is_almost_linear(y1, y2, y3, x1, x2, x3, fc::AbstractFuncConfig, agc::AbstractAutoGridConfig)
+function is_almost_linear(y1, y2, y3, x1, x2, x3, fc::AbstractFuncConfig, agc::AbstractAutoGridConfig)
     # We assume that x2-x1 \approx  x3-x2, so we need to check that y2-y1 approx y3-y2
     # Essentially low second derivative compared to derivative, so that linear approximation is good.
     # Second argument to avoid too small steps when derivatives are small
     dd = derivderiv2(y1,y2,y3,x1,x2,x3)
     #rhs = max((agc.reltol_dd)^2*max(deriv2(y2,y1,x2,x1), deriv2(y3,y2,x3,x2)), (agc.abstol_dd)^2)
     d = max(deriv2(y2,y1,x2,x1), deriv2(y3,y2,x3,x2))
-    # println("$dd < $d")
-    # println("$dd < $(max(d, agc.abstol_dd))")
-    # println("$y1, $y2, $y3")
-    # println("$(lhs < rhs) lhs/rhs: $lhs, $rhs")
     return dd <  agc.reltol_dd*max(d, agc.abstol_dd)/(x3-x1)^2
 end
-@inline is_almost_linear(y1, ym, y2, x1, x2, x3, fc::SavingFuncConfig, agc::AbstractAutoGridConfig) = true
+is_almost_linear(y1, ym, y2, x1, x2, x3, fc::SavingFuncConfig, agc::AbstractAutoGridConfig) = true
 
 deriv2(y1,y2,x1,x2) = normdiff2(y1,y2)/abs2(x1-x2)
 # This will probably never (almost) be called
@@ -276,13 +268,10 @@ end
 
 
 function derivderiv2(y1,y2,y3,x1,x2,x3)
-    # println("x:",x1,x2,x3)
-    # println("y:",y1,y2,y3)
     d1 = abs(x1-x2)
     d2 = abs(x2-x3)
     diff = normdiffdiff2(y1,y2,y3,d1,d2)
     dsquare = (d1*d2*(d1+d2))^2/4
-    # println("before: $diff, dsquare: $dsquare")
     diff/dsquare
 end
 
@@ -318,8 +307,6 @@ end
 @generated function tuple_of_vectors(yi_id::Tuple{Vararg{<:Any,N}}, funcConfigs::Tuple{Vararg{<:AbstractFuncConfig,N}}) where {N}
     vec = []
     for i in 1:N
-        # println("Generating")
-        # println(funcConfigs)
         # if funcConfigs.types[i] <: AbstractFuncConfig{true}
             push!(vec, :([yi_id[$i],]))
         # else
@@ -332,8 +319,6 @@ end
 @generated function pop_tuple_of_vectors!(vals::Tuple{Vararg{<:Any,N}}, funcConfigs::Tuple{Vararg{<:AbstractFuncConfig,N}}) where {N}
     vec = []
     for i in 1:N
-        # println("Generating")
-        # println(funcConfigs)
         # if funcConfigs.types[i] <: AbstractFuncConfig{true}
             push!(vec, :(pop!(vals[$i])))
         # else
@@ -348,5 +333,29 @@ function save(values, ym_id, funcConfig::AbstractFuncConfig)
     push!(values, ym_id)
     return nothing
 end
+
+
+@generated function tuple_map(func, args...)
+    vec = []
+    N = 0
+    for arg in args
+        if arg <: Tuple
+            N = length(arg.types)
+        end
+    end
+    for i in 1:N
+        ex = []
+        for j in 1:length(args)
+            if args[j] <: Tuple
+                push!(ex, :(args[$j][$i]))
+            else
+                push!(ex, :(args[$j]))
+            end
+        end
+        push!(vec, :(func($(ex...))))
+    end
+    :(Core.tuple($(vec...),))
+end
+
 
 end
