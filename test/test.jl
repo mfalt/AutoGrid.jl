@@ -1,4 +1,3 @@
-
 using AutoGrid
 
 # global count = 0
@@ -6,12 +5,13 @@ func = function (x)
     # global count
     # count += 1
     return (abs(x)<pi ? sin(x) : x > 0 ? -(pi-x)^2 : (-pi-x)^2, abs(x-0.15)+2)
+    # return (sin(x),)
 end
-lims = (-3, 3)
+lims = (-1.5, 1.6)
 xscale = identity
 xscale_inv = identity
-funcConfigs = (FuncConfig(identity, find_peaks=true), FuncConfig(identity, find_peaks=true))
-agc = AutoGridConfig(func, lims, xscale, xscale_inv, funcConfigs, min_eps=1e-6)
+funcConfigs = (FuncConfig(identity, find_peaks=false), FuncConfig(identity, find_peaks=false))
+agc = AutoGridConfig(func, lims, xscale, xscale_inv, funcConfigs)
 
 values, grid = auto_grid(agc);
 @show length(grid)
@@ -27,7 +27,7 @@ using BenchmarkTools
 function bench1(grid)
     func.(grid)
 end
-@btime bench1(grid)
+@btime bench1(grid);
 
 function bench2(grid)
     vec = [func(grid[1]),]

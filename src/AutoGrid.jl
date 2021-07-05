@@ -65,7 +65,7 @@ WrappingFuncConfig(args...; kwargs...) = WrappingFuncConfig{true}(args...; kwarg
 AutoGridConfig(func::FuncT, lims::NTuple{2,LT}, xscale::XscaleT, xscale_inv::XscaleInvT, funcConfigs::FuncConfigs;
                 start_gridpoints=30, maxgridpoints=2000,
                 min_eps::FloatT=(xscale(lims[2])-xscale_inv(lims[1]))/10000,
-                reltol_dd::FloatT=0.05, abstol_dd::FloatT=1e-2) where {N, FloatT<:Number, FuncT<:Function, XscaleT<:Function, XscaleInvT<:Function, FuncConfigs<:Tuple{Vararg{<:AbstractFuncConfig,N}}, LT<:Number} =
+                reltol_dd::FloatT=0.1, abstol_dd::FloatT=1e-6) where {N, FloatT<:Number, FuncT<:Function, XscaleT<:Function, XscaleInvT<:Function, FuncConfigs<:Tuple{Vararg{<:AbstractFuncConfig,N}}, LT<:Number} =
     AutoGridConfig{N, FloatT, FuncT, XscaleT, XscaleInvT, FuncConfigs, LT}(func, lims, xscale, xscale_inv, funcConfigs, start_gridpoints, maxgridpoints, min_eps, reltol_dd, abstol_dd)
 """
 values, grid = auto_grid(func::Function, N, lims::Tuple, xscale=(identity, identity), FINCCONFIGSDEF; start_gridpoints, maxgridpoints, min_eps, reltol_dd, abstol_dd)
@@ -111,140 +111,120 @@ values, grid = auto_grid(agc::AutoGridConfig)
 #     min_eps=(xscale[1](lims[2])-xscale[1](lims[1]))/10000,
 #     reltol_dd=0.05, abstol_dd=1e-2)
 function auto_grid(agc::AbstractAutoGridConfig)
-    
-    # Linearly spaced grid in xscale
-    init_grid = LinRange(agc.xscale(agc.lims[1]), agc.xscale(agc.lims[2]), agc.start_gridpoints)
-    
-    # Current count of number mindpoints
     num_gridpoints = agc.start_gridpoints
-
     func = agc.func
     funcConfigs = agc.funcConfigs
-    # Current left point
-    x1 = init_grid[1]
-    x1_id = agc.xscale_inv(x1)
     
-    y1 = apply_config_scales(funcConfigs, func(x1_id))
-    prev_val_ref = Ref{Ref{typeof(y1)}}()
+    # Linearly spaced grid in xscale
+    init_grid = collect(LinRange(agc.xscale(agc.lims[1]), agc.xscale(agc.lims[2]), agc.start_gridpoints))
 
-    y1_id = func(x1_id)
+    x1, x1_id, y1, y1_id = eval_at_point(agc, init_grid[1])
 
-    # The full set of gridpoints
-    grid = [x1_id,]
-    # Tuple with list of all values (Faster than list of tuples + reshaping)
-    #values = ntuple(i -> (saving ? [y1_id[i],] : nothing), length(yscales)) # Type unstable, but low performance cost, but affects output
-    values = tuple_of_vectors(y1_id, funcConfigs)
+    values_id = tuple_of_vectors(y1_id, funcConfigs)
+    grid_id = [x1_id,]
 
-    for (i,x2) in enumerate(init_grid)
-        i == 1 && continue # The first interval starts at 1 -> 2
-        # Needed when looking for local optima
-        next_val_ref = Ref(Ref(apply_config_scales(funcConfigs,func(agc.xscale_inv(init_grid[i])+agc.min_eps/10))))
-        # else
-        #     next_val_ref = Ref{Ref{typeof(y1)}}()
-        # end
-        # Scale back to identity
-        x2_id = agc.xscale_inv(x2)
-        y2_id = func(x2_id)
-        y2 = apply_config_scales(funcConfigs, y2_id)
-        # Refine (if nessesary) section (x1,x2)
-        num_gridpoints = refine_grid!(values, grid, x1, x2, y1, y2, y1_id, y2_id, prev_val_ref, next_val_ref, true, num_gridpoints, agc)
-        # We are now done with [x1,x2]
-        # Continue to next segment
-        x1 = x2
-        y1 = y2
-        y1_id = y2_id
+    xend, xend_id, yend, yend_id = eval_at_point(agc, init_grid[end])
+    
+    buffer_x = [xend,]
+    buffer_x_id = [xend_id,]
+    buffer_values = tuple_of_vectors(yend, funcConfigs)
+    buffer_values_id = tuple_of_vectors(yend_id, funcConfigs)
+    # Fill right buffer with 2,.....,(end-1) in reverse order
+    # xend is already added
+    for i in (length(init_grid)-1):-1:2
+        xi, xi_id, yi, yi_id = eval_at_point(agc, init_grid[i])
+        push_buffers!(xi, xi_id, yi, yi_id, buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
     end
-    return values, grid
+
+    x2, x2_id, y2, y2_id = pop_buffers!(buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
+    x3, x3_id, y3, y3_id = pop_buffers!(buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
+
+    # Inside loop we assume x1,x2,x3 are set to current interval
+    # x1, y1 should already be in `grid`, `values_id` etc., x2, x3 not
+    while true
+        stop_refine = num_gridpoints >= agc.maxgridpoints
+        stop_refine && @warn "Maximum number of gridpoints reached in refine_grid! at $x2_id, no further refinement will be made. Increase maxgridpoints to get better accuracy." maxlog=1
+        # TODO! use differences in x
+        if !stop_refine && (max(abs(x2 - x1),abs(x3 - x2)) >= agc.min_eps) && should_refine(y1, y2, y3, x1, x2, x3, agc)
+            xm_right = (x2+x3)/2
+            xm_left = (x1+x2)/2
+            # Rightmost point
+            push_buffers!(x3, x3_id, y3, y3_id, buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
+            # Second to last point 
+            xi, xi_id, yi, yi_id = eval_at_point(agc, xm_right)
+            push_buffers!(xi, xi_id, yi, yi_id, buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
+            # Old middle point is now last point
+            x3, x3_id, y3, y3_id = x2, x2_id, y2, y2_id
+            # New middle point
+            x2, x2_id, y2, y2_id = eval_at_point(agc, xm_left)
+            num_gridpoints += 2
+        else
+            # Save completed values to output
+            push!(grid_id, x2_id)
+            map(save, values_id, y2_id, agc.funcConfigs)
+
+            if isempty(buffer_x) # We are done
+                push!(grid_id, x3_id)
+                map(save, values_id, y3_id, agc.funcConfigs)
+                break
+            end
+            # Prepare for next loop
+            x1, x1_id, y1, y1_id = x2, x2_id, y2, y2_id
+            x2, x2_id, y2, y2_id = x3, x3_id, y3, y3_id
+            x3, x3_id, y3, y3_id = pop_buffers!(buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
+            # Go to the next point
+        end
+    end
+    return values_id, grid_id
+end
+
+function eval_at_point(agc, xi)
+    xi_id = agc.xscale_inv(xi)
+    yi_id = agc.func(xi_id)
+    yi = apply_config_scales(agc.funcConfigs, yi_id)
+    return xi, xi_id, yi, yi_id
+end
+
+function push_buffers!(xi, xi_id, yi, yi_id, buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
+    push!(buffer_x, xi) # Slightly unnessesary alloc
+    push!(buffer_x_id, xi_id)
+    map(save, buffer_values, yi, funcConfigs)
+    map(save, buffer_values_id, yi_id, funcConfigs)
+    return
+end
+
+function pop_buffers!(buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
+    xi = pop!(buffer_x)
+    xi_id = pop!(buffer_x_id)
+    yi = pop_tuple_of_vectors!(buffer_values, funcConfigs)
+    yi_id = pop_tuple_of_vectors!(buffer_values_id, funcConfigs)
+    return xi, xi_id, yi, yi_id
 end
 
 apply_scale(fc::AbstractFuncConfig, y_id) = fc.yscale(y_id)
-apply_scale(fc::SavingFuncConfig, y_id) = nothing
+#apply_scale(fc::SavingFuncConfig, y_id) = nothing
 
 function apply_config_scales(funcConfigs, y_id)
     map(apply_scale, funcConfigs, y_id)
 end
 
-# Given range (x1, x2) potentially add more gridpoints. x1 is assumed to be already added, x2 will be added
-function refine_grid!(values, grid, x1, x2, y1, y2, y1_id, y2_id, prev_val_ref, next_val_ref, close_to_next_val_ref, num_gridpoints, agc::AbstractAutoGridConfig)
-    # In scaled grid
-    xm = (x1+x2)/2
-
-    # Scaled back
-    xm_id = agc.xscale_inv(xm)
-    ym_id = agc.func(xm_id)
-    ym = apply_config_scales(agc.funcConfigs, ym_id)
-    # println("$x1, $xm, $x2")
-    # isassigned(prev_val_ref) && isassigned(next_val_ref) && println("$(prev_val_ref[][]), $y1, $ym, $y2, $(next_val_ref[][])")
-    (num_gridpoints >= agc.maxgridpoints) && @warn "Maximum number of gridpoints reached in refine_grid! at $xm_id, no further refinement will be made. Increase maxgridpoints to get better accuracy." maxlog=1
-    #min_eps in scaled version, abs to avoid assuming monotonly increasing scale
-    if (abs(x2 - x1) >= agc.min_eps) && (num_gridpoints < agc.maxgridpoints)
-        refine_left, refine_right = should_refine(y1, ym, y2, prev_val_ref, next_val_ref, agc)
-    else
-        refine_left = refine_right = false
-    end
-
-    if refine_left
-        # println("Ref left")
-        refnext = Ref(Ref(y2))
-        num_gridpoints = refine_grid!(values, grid, x1, xm, y1, ym, y1_id, ym_id, prev_val_ref, refnext, false, num_gridpoints, agc)
-    else # We are done up until xm
-        push!(grid, xm_id)
-        map(save, values, ym_id, agc.funcConfigs)
-        num_gridpoints += 1
-    end
-
-    if refine_right
-        # println("Ref right")
-        if !refine_left && !close_to_next_val_ref # Only occurs when looking for local optima
-            # Could restrict further to only when right point if far away
-            # Some extra evaluations here to avoid problems with right point being far away
-            refnext = Ref(Ref(apply_config_scales(agc.funcConfigs,agc.func(agc.xscale_inv(x2)+agc.min_eps/10))))
-            close_to_next_val_ref = true
-        else
-            refnext = next_val_ref
-        end
-        num_gridpoints = refine_grid!(values, grid, xm, x2, ym, y2, ym_id, y2_id, prev_val_ref, refnext, close_to_next_val_ref, num_gridpoints, agc)
-    else # We are done up until x2
-        push!(grid, agc.xscale_inv(x2))
-        map(save, values, y2_id, agc.funcConfigs)
-        num_gridpoints += 1
-        # The last point before x2 was xm
-        prev_val_ref[] = Ref(ym)
-    end
-
-    return num_gridpoints
-end
-
-
-
 # TODO We can scale when saving instead of recomputing scaling
 # Svectors should also be faster in general
-function should_refine(v1, v2, v3, prev_val_ref, next_val_ref, agc::AbstractAutoGridConfig)
-    
-    not_linear = !all(is_almost_linear.(v1, v2, v3, agc.funcConfigs, Ref(agc))) # Ref so struct is scalar
-    not_linear && return true, true
-
-    prev_val = isassigned(prev_val_ref) ? prev_val_ref[][] : nothing
-    next_val = isassigned(next_val_ref) ? next_val_ref[][] : nothing
-    pot_peaks = potential_peak.(v1, v2, v3, prev_val, next_val, agc.funcConfigs, Ref(agc))
-    left_peaks = any(getindex.(pot_peaks, 1))
-    right_peaks = any(getindex.(pot_peaks, 2))
-    return left_peaks, right_peaks
+function should_refine(v1, v2, v3, x1, x2, x3, agc::AbstractAutoGridConfig)
+    not_linear = !all(is_almost_linear.(v1, v2, v3, x1, x2, x3, agc.funcConfigs, Ref(agc))) # Ref so struct is scalar
+    if not_linear
+        # println("Not linear")
+        return not_linear
+    else
+        # println("Linear")
+    end
+    is_peak = any(potential_peak.(v1, v2, v3, agc.funcConfigs, Ref(agc)))
+    # println("Peak: $is_peak")
+    return is_peak
 end
 
-function potential_peak(y1, ym, y2, prev_val, next_val, fc::AbstractFuncConfig, agc::AbstractAutoGridConfig)
-    if fc.find_peaks
-        #c1 = dot(ym-y1, y2-ym) < 0
-        c1 = dotdiff(ym,y1,y2,ym) < 0
-        c1 && return true, true
-        # c2 = (prev_val !== nothing && dot(y1-prev_val, ym-y1) < 0)
-        # c3 = (next_val !== nothing && dot(y2-ym, next_val-y2) < 0)
-        c2 = (prev_val !== nothing && dotdiff(y1,prev_val,ym,y1) < 0)
-        c3 = (next_val !== nothing && dotdiff(y2,ym,next_val,y2) < 0)
-        return c2, c3
-    else
-        return false, false
-    end
+function potential_peak(y1, y2, y3, fc::AbstractFuncConfig, agc::AbstractAutoGridConfig)
+    return fc.find_peaks && dotdiff(y2,y1,y3,y2) < 0
 end
 
 @inline dotdiff(v1::T,v2::T,v3::T,v4::T) where T<:Real = (v1-v2)*(v3-v4)
@@ -257,26 +237,30 @@ end
     return s
 end
 
-@inline function is_almost_linear(y1, ym, y2, fc::AbstractFuncConfig, agc::AbstractAutoGridConfig)
-    # We assume that x2-x1 \approx  x3-x2, so we need to check that ym-y1 approx y2-ym
+@inline function is_almost_linear(y1, y2, y3, x1, x2, x3, fc::AbstractFuncConfig, agc::AbstractAutoGridConfig)
+    # We assume that x2-x1 \approx  x3-x2, so we need to check that y2-y1 approx y3-y2
     # Essentially low second derivative compared to derivative, so that linear approximation is good.
     # Second argument to avoid too small steps when derivatives are small
-    lhs = normdiffdiff2(y1,ym,y2)
-    rhs = max((agc.reltol_dd)^2*max(normdiff2(ym,y1), normdiff2(y2,ym)), (agc.abstol_dd)^2)
-    # println("$y1, $ym, $y2")
+    dd = derivderiv2(y1,y2,y3,x1,x2,x3)
+    #rhs = max((agc.reltol_dd)^2*max(deriv2(y2,y1,x2,x1), deriv2(y3,y2,x3,x2)), (agc.abstol_dd)^2)
+    d = max(deriv2(y2,y1,x2,x1), deriv2(y3,y2,x3,x2))
+    # println("$dd < $d")
+    # println("$dd < $(max(d, agc.abstol_dd))")
+    # println("$y1, $y2, $y3")
     # println("$(lhs < rhs) lhs/rhs: $lhs, $rhs")
-    return lhs < rhs
+    return dd <  agc.reltol_dd*max(d, agc.abstol_dd)/(x3-x1)^2
 end
-@inline is_almost_linear(y1, ym, y2, fc::SavingFuncConfig, agc::AbstractAutoGridConfig) = true
+@inline is_almost_linear(y1, ym, y2, x1, x2, x3, fc::SavingFuncConfig, agc::AbstractAutoGridConfig) = true
 
+deriv2(y1,y2,x1,x2) = normdiff2(y1,y2)/abs2(x1-x2)
 # This will probably never (almost) be called
-@inline normdiff2(x::Number,y::Number) = abs2(x-y)
+@inline normdiff2(y1::Number,y2::Number) = abs2(y1-y2)
 
-function normdiff2(x::A,y::A) where {T<:Number, N, A <: Union{NTuple{N,T},AbstractArray{T}}}
-    length(x) == length(y) || throw(DimensionMismatch())
-    sum = abs2(x[1]-y[1])
-    @inbounds for i in 2:length(x)
-        sum += abs2(x[i]-y[i])
+function normdiff2(y1::A,y2::A) where {T<:Number, N, A <: Union{NTuple{N,T},AbstractArray{T}}}
+    length(y1) == length(y2) || throw(DimensionMismatch())
+    sum = abs2(y1[1]-y2[1])
+    @inbounds for i in 2:length(y1)
+        sum += abs2(y1[i]-y2[i])
     end
     return sum
 end
@@ -291,22 +275,33 @@ end
 # @inline normdiff(x,y) = sqrt(normdiff2(x,y))
 
 
-# This will probably never(almost) be called
-@inline normdiffdiff2(x::Number,y::Number,z::Number) = abs2(y+y-x-z)
+function derivderiv2(y1,y2,y3,x1,x2,x3)
+    # println("x:",x1,x2,x3)
+    # println("y:",y1,y2,y3)
+    d1 = abs(x1-x2)
+    d2 = abs(x2-x3)
+    diff = normdiffdiff2(y1,y2,y3,d1,d2)
+    dsquare = (d1*d2*(d1+d2))^2/4
+    # println("before: $diff, dsquare: $dsquare")
+    diff/dsquare
+end
 
-function normdiffdiff2(x::A,y::A,z::A) where {T<:Number, N, A <: Union{NTuple{N,T},AbstractArray{T}}}
+# This will probably never(almost) be called
+@inline normdiffdiff2(x::Number,y::Number,z::Number,d1,d2) = abs2(d2*x+d1*z-(d1+d2)*y)
+
+function normdiffdiff2(x::A,y::A,z::A,d1,d2) where {T<:Number, N, A <: Union{NTuple{N,T},AbstractArray{T}}}
     length(x) == length(y) || throw(DimensionMismatch())
-    sum = abs2(y[1]+y[1]-x[1]-z[1])
+    sum = abs2(d2*x[1]+d1*z[1]-(d1+d2)*y[1])
     @inbounds for i in 2:length(x)
-        sum += abs2(y[i]+y[i]-x[i]-z[i])
+        sum += abs2(d2*x[i]+d1*z[i]-(d1+d2)*y[i])
     end
     return sum
 end
-function normdiffdiff2(x,y,z)
+function normdiffdiff2(x,y,z,d1,d2)
     length(x) == length(y) || throw(DimensionMismatch())
-    sum = normdiffdiff2(x[1],y[1],z[1])
+    sum = normdiffdiff2(x[1],y[1],z[1],d1,d2)
     @inbounds for i in 2:length(x)
-        sum += normdiffdiff2(x[i],y[i],z[i])
+        sum += normdiffdiff2(x[i],y[i],z[i],d1,d2)
     end
     return sum
 end
@@ -320,82 +315,38 @@ end
 #     :(Core.tuple($(vec...)))
 # end
 
-@generated function tuple_of_vectors(y1_id::Tuple{Vararg{<:Any,N}}, funcConfigs::Tuple{Vararg{<:AbstractFuncConfig,N}}) where {N}
+@generated function tuple_of_vectors(yi_id::Tuple{Vararg{<:Any,N}}, funcConfigs::Tuple{Vararg{<:AbstractFuncConfig,N}}) where {N}
     vec = []
     for i in 1:N
         # println("Generating")
         # println(funcConfigs)
-        if funcConfigs.types[i] <: AbstractFuncConfig{true}
-            push!(vec, :([y1_id[$i],]))
-        else
-            push!(vec, :(nothing))
-        end
+        # if funcConfigs.types[i] <: AbstractFuncConfig{true}
+            push!(vec, :([yi_id[$i],]))
+        # else
+            # push!(vec, :(nothing))
+        # end
     end
     :(Core.tuple($(vec...),))
 end
 
-save(values, ym_id, funcConfig::AbstractFuncConfig{false}) = nothing
-function save(values, ym_id, funcConfig::AbstractFuncConfig{true})
+@generated function pop_tuple_of_vectors!(vals::Tuple{Vararg{<:Any,N}}, funcConfigs::Tuple{Vararg{<:AbstractFuncConfig,N}}) where {N}
+    vec = []
+    for i in 1:N
+        # println("Generating")
+        # println(funcConfigs)
+        # if funcConfigs.types[i] <: AbstractFuncConfig{true}
+            push!(vec, :(pop!(vals[$i])))
+        # else
+            # push!(vec, :(nothing))
+        # end
+    end
+    :(Core.tuple($(vec...),))
+end
+
+#save(values, ym_id, funcConfig::AbstractFuncConfig{false}) = nothing
+function save(values, ym_id, funcConfig::AbstractFuncConfig)
     push!(values, ym_id)
     return nothing
 end
 
 end
-
-
-
-# function auto_grid_alloc(agc::AbstractAutoGridConfig)
-#     func = agc.func
-#     yscales = agc.yscales
-
-#     # Linearly spaced grid in xscale
-#     init_grid = LinRange(agc.xscale(agc.lims[1]), agc.xscale(agc.lims[2]), agc.start_gridpoints)
-
-#     # Current count of number mindpoints
-#     num_gridpoints = agc.start_gridpoints
-
-#     # Current left point
-#     x1 = init_grid[1]
-#     x1_id = agc.xscale_inv(x1)
-#     y1 = apply_tuple3(yscales, func(x1_id))
-#     y1_id = func(x1_id)
-
-
-#     # The full set of gridpoints
-#     grid = [x1_id,]
-#     # Tuple with list of all values (Faster than list of tuples + reshaping)
-#     #values = ntuple(i -> [y1_id[i],], length(yscales)) # Type unstable, but low performance cost, but affects output
-#     values = tuple_of_vectors(y1_id)
-
-#     # Compute some values on initial grid
-#     init_grid_vals = similar.(values, agc.start_gridpoints)
-
-#     for (i,x) in enumerate(init_grid)
-#         x_id = agc.xscale_inv(x)
-#         y_id = func(x_id)
-#         y = apply_tuple3(yscales, y_id)
-#         setindex!.(init_grid_vals, y, i)
-#     end
-#     @show abs.(init_grid_vals[1])
-#     @show real.(diff(init_grid_vals[1]))
-#     grid_norms = [norm.(init_grid_vals[i])./(init_grid[2]-init_grid[1]) for i in 1:length(init_grid_vals)]
-#     grid_diffs_norms = [sqrt.(normdiff2.(init_grid_vals[i][1:end-1],init_grid_vals[i][2:end]))./(init_grid[2]-init_grid[1]) for i in 1:length(init_grid_vals)]
-#     println(grid_norms)
-#     println(grid_diffs_norms)
-#     # println(diffs)
-
-#     for x2 in init_grid[2:end]
-#         # Scale back to identity
-#         x2_id = agc.xscale_inv(x2)
-#         y2_id = func(x2_id)
-#         y2 = apply_tuple3(yscales, y2_id)
-#         # Refine (if nessesary) section (x1,x2)
-#         num_gridpoints = refine_grid!(values, grid, x1, x2, y1, y2, y1_id, y2_id, num_gridpoints, agc)
-#         # We are now done with [x1,x2]
-#         # Continue to next segment
-#         x1 = x2
-#         y1 = y2
-#         y1_id = y2_id
-#     end
-#     return values, grid
-# end
