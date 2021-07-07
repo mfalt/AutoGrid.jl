@@ -41,7 +41,7 @@ struct SavingFuncConfig{saving} <: AbstractFuncConfig{saving}
     end
     SavingFuncConfig() = SavingFuncConfig{true}()
 end
-function Base.getproperty(sfc::SavingFuncConfig, sym)
+function Base.getproperty(sfc::SavingFuncConfig, sym::Symbol)
     if sym === :yscale
         return nothingfun
     elseif sym === :find_peaks
@@ -51,20 +51,28 @@ function Base.getproperty(sfc::SavingFuncConfig, sym)
     end
 end
 
-struct WrappingFuncConfig{saving, YscaleT<:Function, Diff2T, Diff3T, T<:Number} <: AbstractFuncConfig{saving}
-    yscale::YscaleT
+struct WrappingFuncConfig{saving, Diff2T, Diff3T, T<:Number} <: AbstractFuncConfig{saving}
+    # yscale::YscaleT
     find_peaks::Bool
     wraplims::Tuple{T,T}
     diff2::Diff2T
     diff3::Diff3T
-    WrappingFuncConfig{saving}(yscale, wraplims; find_peaks=true, diff2=normdiff2, diff3=normdiffdiff2) where saving=
-        new{saving, typeof(yscale), typeof(wraplims), typeof(diff2), typeof(diff3)}(yscale, find_peaks, wraplims, diff2, diff3)
+    WrappingFuncConfig{saving}(wraplims; find_peaks=true, diff2=normdiff2, diff3=normdiffdiff2) where saving=
+        new{saving, typeof(diff2), typeof(diff3), typeof(wraplims[1])}(find_peaks, wraplims, diff2, diff3)
 end
 WrappingFuncConfig(args...; kwargs...) = WrappingFuncConfig{true}(args...; kwargs...)
 
+function Base.getproperty(sfc::WrappingFuncConfig, sym::Symbol)
+    if sym === :yscale
+        return identity
+    else
+        return getfield(sfc, sym)
+    end
+end
+
 AutoGridConfig(func::FuncT, lims::NTuple{2,LT}, xscale::XscaleT, xscale_inv::XscaleInvT, funcConfigs::FuncConfigs;
                 start_gridpoints=30, maxgridpoints=2000,
-                min_eps::FloatT=(xscale(lims[2])-xscale_inv(lims[1]))/10000,
+                min_eps::FloatT=(xscale(lims[2])-xscale_inv(lims[1]))/100000,
                 reltol_dd::FloatT=0.1, abstol_dd::FloatT=1e-6) where {N, FloatT<:Number, FuncT<:Function, XscaleT<:Function, XscaleInvT<:Function, FuncConfigs<:Tuple{Vararg{<:AbstractFuncConfig,N}}, LT<:Number} =
     AutoGridConfig{N, FloatT, FuncT, XscaleT, XscaleInvT, FuncConfigs, LT}(func, lims, xscale, xscale_inv, funcConfigs, start_gridpoints, maxgridpoints, min_eps, reltol_dd, abstol_dd)
 """
@@ -139,12 +147,15 @@ function auto_grid(agc::AbstractAutoGridConfig)
     x2, x2_id, y2, y2_id = pop_buffers!(buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
     x3, x3_id, y3, y3_id = pop_buffers!(buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
 
+    y1, y2, y3 = potential_unwrap(y1, y2, y3, x1, x2, x3, agc)
+
     # Inside loop we assume x1,x2,x3 are set to current interval
     # x1, y1 should already be in `grid`, `values_id` etc., x2, x3 not
     while true
         stop_refine = num_gridpoints >= agc.maxgridpoints
         stop_refine && @warn "Maximum number of gridpoints reached in refine_grid! at $x2_id, no further refinement will be made. Increase maxgridpoints to get better accuracy." maxlog=1
 
+        y1, y2, y3 = potential_unwrap(y1, y2, y3, x1, x2, x3, agc)
         if !stop_refine && (max(abs(x2 - x1),abs(x3 - x2)) >= agc.min_eps) && should_refine(y1, y2, y3, x1, x2, x3, agc)
             xm_right = (x2+x3)/2
             xm_left = (x1+x2)/2
@@ -161,11 +172,11 @@ function auto_grid(agc::AbstractAutoGridConfig)
         else
             # Save completed values to output
             push!(grid_id, x2_id)
-            tuple_map(save, values_id, y2_id, agc.funcConfigs)
+            tuple_map(save, values_id, y2_id, y2, agc.funcConfigs)
 
             if isempty(buffer_x) # We are done
                 push!(grid_id, x3_id)
-                tuple_map(save, values_id, y3_id, agc.funcConfigs)
+                tuple_map(save, values_id, y3_id, y3, agc.funcConfigs)
                 break
             end
             # Prepare for next loop
@@ -188,8 +199,8 @@ end
 function push_buffers!(xi, xi_id, yi, yi_id, buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
     push!(buffer_x, xi) # Slightly unnessesary alloc
     push!(buffer_x_id, xi_id)
-    tuple_map(save, buffer_values, yi, funcConfigs)
-    tuple_map(save, buffer_values_id, yi_id, funcConfigs)
+    tuple_map(save, buffer_values, yi, yi, funcConfigs)
+    tuple_map(save, buffer_values_id, yi_id, yi_id, funcConfigs)
     return
 end
 
@@ -243,6 +254,24 @@ function is_almost_linear(y1, y2, y3, x1, x2, x3, fc::AbstractFuncConfig, agc::A
     return dd <  agc.reltol_dd*max(d, agc.abstol_dd)/(x3-x1)^2
 end
 is_almost_linear(y1, ym, y2, x1, x2, x3, fc::SavingFuncConfig, agc::AbstractAutoGridConfig) = true
+
+
+function potential_unwrap(v1, v2, v3, x1, x2, x3, agc::AbstractAutoGridConfig)
+    vnew = tuple_map(potential_unwrap, v1, v2, v3, x1, x2, x3, agc.funcConfigs, agc)
+    v1_new, v2_new, v3_new =  zip(vnew...)
+    return v1_new, v2_new, v3_new
+end
+
+potential_unwrap(y1, y2, y3, x1, x2, x3, fc::AbstractFuncConfig, agc::AbstractAutoGridConfig) = y1, y2, y3
+
+function potential_unwrap(y1, y2, y3, x1, x2, x3, fc::WrappingFuncConfig, agc::AbstractAutoGridConfig)
+    mid = +(fc.wraplims...)/2
+    width = -(-(fc.wraplims...))
+    y2new = y2 - fld(y2-y1 + mid, width) * width
+    y3new = y3 - fld(y3-y2new + mid, width) * width
+    return y1, y2new, y3new
+end
+
 
 deriv2(y1,y2,x1,x2) = normdiff2(y1,y2)/abs2(x1-x2)
 # This will probably never (almost) be called
@@ -329,8 +358,14 @@ end
 end
 
 #save(values, ym_id, funcConfig::AbstractFuncConfig{false}) = nothing
-function save(values, ym_id, funcConfig::AbstractFuncConfig)
+function save(values,  ym_id, ym, funcConfig::AbstractFuncConfig)
     push!(values, ym_id)
+    return nothing
+end
+
+# We force Wrapping to be identity mapping. The unwrapped values are in ym
+function save(values,  ym_id, ym, funcConfig::WrappingFuncConfig)
+    push!(values, ym)
     return nothing
 end
 
@@ -356,6 +391,5 @@ end
     end
     :(Core.tuple($(vec...),))
 end
-
 
 end
