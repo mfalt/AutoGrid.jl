@@ -147,28 +147,54 @@ function auto_grid(agc::AbstractAutoGridConfig)
     x2, x2_id, y2, y2_id = pop_buffers!(buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
     x3, x3_id, y3, y3_id = pop_buffers!(buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
 
-    y1, y2, y3 = potential_unwrap(y1, y2, y3, x1, x2, x3, agc)
+    # y1, y2, y3, unwrap_refine = potential_unwrap(y1, y2, y3, x1, x2, x3, agc)
 
     # Inside loop we assume x1,x2,x3 are set to current interval
     # x1, y1 should already be in `grid`, `values_id` etc., x2, x3 not
+    unwrap_fail = false
     while true
         stop_refine = num_gridpoints >= agc.maxgridpoints
         stop_refine && @warn "Maximum number of gridpoints reached in refine_grid! at $x2_id, no further refinement will be made. Increase maxgridpoints to get better accuracy." maxlog=1
 
-        y1, y2, y3 = potential_unwrap(y1, y2, y3, x1, x2, x3, agc)
-        if !stop_refine && (max(abs(x2 - x1),abs(x3 - x2)) >= agc.min_eps) && should_refine(y1, y2, y3, x1, x2, x3, agc)
-            xm_right = (x2+x3)/2
-            xm_left = (x1+x2)/2
+        y1, y2, y3, unwrap_refine = potential_unwrap(y1, y2, y3, x1, x2, x3, agc)
+        deriv_refine = should_refine(y1, y2, y3, x1, x2, x3, agc)
+        eps_too_small = (max(abs(x2 - x1),abs(x3 - x2)) < agc.min_eps)
+        # If unwrapping unsuccessful and epsilon already too small
+        if !unwrap_fail && unwrap_refine && eps_too_small
+            # TODO change this to something better, based on derivatives
+            @warn "Unwrapping unnuccessful, unwrapping ignored from now"
+            unwrap_fail = true
+        end
+        if !stop_refine && !eps_too_small && (unwrap_refine || (deriv_refine && !unwrap_fail))
+            refine_left = refine_right = true
+            if 3*abs(x2 - x1) < abs(x3 - x2) # Don't refine a side if one interval is much smaller
+                refine_left = false
+            elseif abs(x2 - x1) > 3*abs(x3 - x2)
+                refine_right = true
+            end
             # Rightmost point
             push_buffers!(x3, x3_id, y3, y3_id, buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
-            # Second to last point 
-            xi, xi_id, yi, yi_id = eval_at_point(agc, xm_right)
-            push_buffers!(xi, xi_id, yi, yi_id, buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
-            # Old middle point is now last point
-            x3, x3_id, y3, y3_id = x2, x2_id, y2, y2_id
-            # New middle point
-            x2, x2_id, y2, y2_id = eval_at_point(agc, xm_left)
-            num_gridpoints += 2
+            if refine_right
+                xm_right = (x2+x3)/2
+                # Second to last point 
+                xi, xi_id, yi, yi_id = eval_at_point(agc, xm_right)
+                if refine_left
+                    # The new point is not used next iteration
+                    push_buffers!(xi, xi_id, yi, yi_id, buffer_x, buffer_x_id, buffer_values, buffer_values_id, funcConfigs)
+                else
+                    # The new right point (possibly)
+                    x3, x3_id, y3, y3_id = xi, xi_id, yi, yi_id
+                end
+                num_gridpoints += 1
+            end
+            if refine_left
+                xm_left = (x1+x2)/2
+                # Old middle point is now last point
+                x3, x3_id, y3, y3_id = x2, x2_id, y2, y2_id
+                # New middle point
+                x2, x2_id, y2, y2_id = eval_at_point(agc, xm_left)
+                num_gridpoints += 1
+            end
         else
             # Save completed values to output
             push!(grid_id, x2_id)
@@ -237,6 +263,7 @@ end
 @inline dotdiff(v1::T,v2::T,v3::T,v4::T) where T<:Real = (v1-v2)*(v3-v4)
 # TODO UNSAFE
 @inline function dotdiff(v1::T,v2::T,v3::T,v4::T) where T
+    (length(v1) == length(v2) == length(v3) == length(v4)) || throw(DimensionMismatch())
     s = zero(dot(first(v1)-first(v2), first(v3)-first(v4)))
     for i in eachindex(v1)
         @inbounds s += dot(v1[i]-v2[i], v3[i]-v4[i])
@@ -258,18 +285,19 @@ is_almost_linear(y1, ym, y2, x1, x2, x3, fc::SavingFuncConfig, agc::AbstractAuto
 
 function potential_unwrap(v1, v2, v3, x1, x2, x3, agc::AbstractAutoGridConfig)
     vnew = tuple_map(potential_unwrap, v1, v2, v3, x1, x2, x3, agc.funcConfigs, agc)
-    v1_new, v2_new, v3_new =  zip(vnew...)
-    return v1_new, v2_new, v3_new
+    v1_new, v2_new, v3_new, do_refine =  zip(vnew...)
+    return v1_new, v2_new, v3_new, any(do_refine)
 end
 
-potential_unwrap(y1, y2, y3, x1, x2, x3, fc::AbstractFuncConfig, agc::AbstractAutoGridConfig) = y1, y2, y3
+potential_unwrap(y1, y2, y3, x1, x2, x3, fc::AbstractFuncConfig, agc::AbstractAutoGridConfig) = y1, y2, y3, false
 
 function potential_unwrap(y1, y2, y3, x1, x2, x3, fc::WrappingFuncConfig, agc::AbstractAutoGridConfig)
     mid = +(fc.wraplims...)/2
     width = -(-(fc.wraplims...))
     y2new = y2 - fld(y2-y1 + mid, width) * width
     y3new = y3 - fld(y3-y2new + mid, width) * width
-    return y1, y2new, y3new
+    do_refine = (sqrt(normdiff2(y2new, y1)) > width/2) || (sqrt(normdiff2(y3new, y2new)) > width/2)
+    return y1, y2new, y3new, do_refine
 end
 
 
